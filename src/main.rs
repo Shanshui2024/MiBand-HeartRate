@@ -1,100 +1,376 @@
-use std::error::Error;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::collections::VecDeque;
-use std::time::Instant;
-
+use std::{error::Error, sync::{Arc, Mutex}, thread, time::Instant};
 use bluest::{Adapter, AdvertisingDevice};
 use futures_lite::stream::StreamExt;
 use tiny_http::{Server, Response, Header};
-use serde::Serialize;
 
-// 共享数据结构存储心率信息
+// 心率监视器结构体
 struct HeartRateMonitor {
     current_rate: u8,
-    device_name: String,
-    rssi: i16,
     last_update: Instant,
-    history: VecDeque<u8>,
-}
-
-#[derive(Serialize)]
-struct HeartRateUpdate {
-    heart_rate: u8,
-    device_name: String,
-    rssi: i16,
-    elapsed_secs: u64,
-    status: String,
-    status_color: String,
-    history: Vec<u8>,
 }
 
 impl HeartRateMonitor {
     fn new() -> Self {
         Self {
             current_rate: 0,
-            device_name: "等待连接...".to_string(),
-            rssi: i16::MIN,
             last_update: Instant::now(),
-            history: VecDeque::with_capacity(60),
         }
     }
     
-    fn update(&mut self, rate: u8, name: &str, rssi: i16) {
+    fn update(&mut self, rate: u8) {
         self.current_rate = rate;
-        self.device_name = name.to_string();
-        self.rssi = rssi;
         self.last_update = Instant::now();
-        
-        // 更新历史数据
-        self.history.push_back(rate);
-        if self.history.len() > 60 {
-            self.history.pop_front();
+    }
+}
+
+// 启动HTTP服务器
+fn start_http_server(heart_rate: Arc<Mutex<HeartRateMonitor>>) {
+    let addr = "0.0.0.0:1145";
+    let server = Server::http(addr).expect("无法启动HTTP服务器");
+    
+    let html_content_type = Header::from_bytes("Content-Type", "text/html; charset=utf-8")
+        .expect("创建内容类型头失败");
+    
+    let json_content_type = Header::from_bytes("Content-Type", "application/json")
+        .expect("创建内容类型头失败");
+
+    for request in server.incoming_requests() {
+        // 数据端点
+        if request.url() == "/data" {
+            let monitor = heart_rate.lock().unwrap();
+            let response = Response::from_string(format!("{}", monitor.current_rate))
+                .with_header(json_content_type.clone());
+            request.respond(response).expect("响应请求失败");
+            continue;
         }
-    }
-    
-    fn is_recent(&self) -> bool {
-        self.last_update.elapsed().as_secs() < 10
+        
+        // 根路径 - 扁平化霓虹灯管风格心率显示 (900x550)
+        let html = r#"
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>霓虹灯管心率监测</title>
+            <style>
+                * {
+                    margin: 0;
+                    padding: 0;
+                    box-sizing: border-box;
+                }
+                
+                body {
+                    background: #0a0a20;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    height: 100vh;
+                    overflow: hidden;
+                    font-family: 'Rajdhani', sans-serif;
+                }
+                
+                .neon-container {
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    gap: 60px;
+                    padding: 40px;
+                    background: rgba(10, 10, 30, 0.8);
+                    border-radius: 20px;
+                    box-shadow: 0 0 50px rgba(0, 100, 255, 0.4);
+                    position: relative;
+                    overflow: hidden;
+                    width: 900px;
+                    height: 550px; /* 900x550尺寸 */
+                }
+                
+                /* 霓虹灯管效果 */
+                .neon-container::before {
+                    content: '';
+                    position: absolute;
+                    top: 0;
+                    left: 0;
+                    right: 0;
+                    height: 3px;
+                    background: linear-gradient(90deg, transparent, #00ffff, transparent);
+                    animation: scan 3s linear infinite;
+                }
+                
+                .heart-section {
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                }
+                
+                .neon-heart {
+                    font-size: 240px; /* 更大的爱心 */
+                    color: #ff0000;
+                    text-shadow: 
+                        0 0 20px #ff0000,
+                        0 0 40px #ff0000,
+                        0 0 80px #ff0000;
+                    animation: heartbeat 1s infinite;
+                    position: relative;
+                    line-height: 1;
+                    margin-bottom: 30px;
+                }
+                
+                .heart-label {
+                    font-size: 36px;
+                    color: #ff5050;
+                    text-shadow: 0 0 15px #ff0000;
+                    letter-spacing: 3px;
+                }
+                
+                .rate-section {
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                }
+                
+                .neon-rate {
+                    font-size: 240px; /* 更大的数字 */
+                    font-weight: bold;
+                    color: #0066ff;
+                    text-shadow: 
+                        0 0 20px #0066ff,
+                        0 0 40px #0066ff,
+                        0 0 80px #0066ff;
+                    position: relative;
+                    line-height: 1;
+                }
+                
+                .neon-rate::after {
+                    content: attr(data-rate);
+                    position: absolute;
+                    top: 0;
+                    left: 0;
+                    color: #00ffff;
+                    filter: blur(25px);
+                    z-index: -1;
+                }
+                
+                .bpm {
+                    font-size: 50px;
+                    color: #00ffff;
+                    text-shadow: 0 0 15px #00ffff;
+                    margin-top: 20px;
+                    letter-spacing: 5px;
+                }
+                
+                .status-dot {
+                    position: absolute;
+                    bottom: 30px;
+                    right: 30px;
+                    width: 20px;
+                    height: 20px;
+                    background: #ff0000;
+                    border-radius: 50%;
+                    box-shadow: 0 0 15px #ff0000;
+                }
+                
+                .connection-status {
+                    position: absolute;
+                    bottom: 30px;
+                    left: 30px;
+                    color: #00ffff;
+                    font-size: 24px;
+                    text-shadow: 0 0 8px #00ffff;
+                }
+                
+                /* 霓虹灯边框效果 */
+                .neon-border {
+                    position: absolute;
+                    top: 0;
+                    left: 0;
+                    width: 100%;
+                    height: 100%;
+                    border: 3px solid #00ffff;
+                    box-shadow: 
+                        inset 0 0 20px #00ffff,
+                        0 0 20px #00ffff;
+                    border-radius: 20px;
+                    pointer-events: none;
+                }
+                
+                /* 霓虹灯角落装饰 */
+                .corner {
+                    position: absolute;
+                    width: 30px;
+                    height: 30px;
+                }
+                
+                .corner-tl {
+                    top: -1px;
+                    left: -1px;
+                    border-top: 5px solid #ff00ff;
+                    border-left: 5px solid #ff00ff;
+                }
+                
+                .corner-tr {
+                    top: -1px;
+                    right: -1px;
+                    border-top: 5px solid #ff00ff;
+                    border-right: 5px solid #ff00ff;
+                }
+                
+                .corner-bl {
+                    bottom: -1px;
+                    left: -1px;
+                    border-bottom: 5px solid #ff00ff;
+                    border-left: 5px solid #ff00ff;
+                }
+                
+                .corner-br {
+                    bottom: -1px;
+                    right: -1px;
+                    border-bottom: 5px solid #ff00ff;
+                    border-right: 5px solid #ff00ff;
+                }
+                
+                /* 动画效果 */
+                @keyframes heartbeat {
+                    0% { transform: scale(1); }
+                    15% { transform: scale(1.15); }
+                    30% { transform: scale(1); }
+                    45% { transform: scale(1.1); }
+                    60% { transform: scale(1); }
+                    100% { transform: scale(1); }
+                }
+                
+                @keyframes scan {
+                    0% { transform: translateX(-100%); }
+                    100% { transform: translateX(100%); }
+                }
+                
+                .pulse {
+                    position: absolute;
+                    top: 50%;
+                    left: 50%;
+                    transform: translate(-50%, -50%);
+                    width: 700px;
+                    height: 400px;
+                    border-radius: 50%;
+                    border: 3px solid rgba(0, 255, 255, 0.5);
+                    box-shadow: 0 0 30px rgba(0, 255, 255, 0.5);
+                    opacity: 0;
+                    animation: pulse 2s infinite;
+                    pointer-events: none;
+                    z-index: -1;
+                }
+                
+                .pulse:nth-child(2) {
+                    animation-delay: 0.5s;
+                }
+                
+                .pulse:nth-child(3) {
+                    animation-delay: 1s;
+                }
+                
+                @keyframes pulse {
+                    0% { 
+                        transform: translate(-50%, -50%) scale(0.8);
+                        opacity: 0.8;
+                    }
+                    100% { 
+                        transform: translate(-50%, -50%) scale(1.3);
+                        opacity: 0;
+                    }
+                }
+            </style>
+            <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;700&display=swap" rel="stylesheet">
+        </head>
+        <body>
+            <div class="neon-container">
+                <div class="pulse"></div>
+                <div class="pulse"></div>
+                <div class="pulse"></div>
+                
+                <div class="heart-section">
+                    <div class="neon-heart">♥</div>
+                </div>
+                
+                <div class="rate-section">
+                    <div class="neon-rate" id="heart-rate" data-rate="0">0</div>
+                </div>
+                
+                <div class="status-dot" id="status-dot"></div>
+                <div class="connection-status" id="connection-status">等待数据...</div>
+                <div class="neon-border"></div>
+                
+                <div class="corner corner-tl"></div>
+                <div class="corner corner-tr"></div>
+                <div class="corner corner-bl"></div>
+                <div class="corner corner-br"></div>
+            </div>
+            
+            <script>
+                let lastHeartRate = 0;
+                let lastUpdate = Date.now();
+                
+                async function updateHeartRate() {
+                    try {
+                        const response = await fetch('/data');
+                        if (!response.ok) return;
+                        
+                        const rateText = await response.text();
+                        const rate = parseInt(rateText);
+                        
+                        if (!isNaN(rate)) {
+                            document.getElementById('heart-rate').textContent = rate;
+                            document.getElementById('heart-rate').setAttribute('data-rate', rate);
+                            lastHeartRate = rate;
+                            lastUpdate = Date.now();
+                            
+                            // 更新状态点颜色
+                            document.getElementById('status-dot').style.background = '#00ff00';
+                            document.getElementById('status-dot').style.boxShadow = '0 0 15px #00ff00';
+                            document.getElementById('connection-status').textContent = '数据正常';
+                        }
+                    } catch (error) {
+                        console.error('获取心率失败:', error);
+                        document.getElementById('connection-status').textContent = '连接错误';
+                    }
+                    
+                    // 如果超过5秒没有更新，显示警告
+                    if (Date.now() - lastUpdate > 5000) {
+                        document.getElementById('status-dot').style.background = '#ff0000';
+                        document.getElementById('status-dot').style.boxShadow = '0 0 15px #ff0000';
+                        document.getElementById('connection-status').textContent = '信号丢失';
+                    }
+                }
+                
+                // 动态调整心跳动画速度
+                function adjustHeartbeat() {
+                    const heart = document.querySelector('.neon-heart');
+                    if (lastHeartRate > 0) {
+                        // 根据心率计算动画时长（心率越高，跳动越快）
+                        const duration = Math.max(400, 1200 - (lastHeartRate * 5));
+                        heart.style.animationDuration = `${duration}ms`;
+                    }
+                }
+                
+                // 立即更新
+                updateHeartRate();
+                
+                // 每秒更新一次
+                setInterval(updateHeartRate, 1000);
+                
+                // 每200毫秒调整一次心跳速度
+                setInterval(adjustHeartbeat, 200);
+            </script>
+        </body>
+        </html>
+        "#;
+        
+        let response = Response::from_string(html)
+            .with_header(html_content_type.clone());
+        request.respond(response).expect("响应请求失败");
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    // 创建共享心率监视器
-    let heart_rate = Arc::new(Mutex::new(HeartRateMonitor::new()));
-    
-    // 启动HTTP服务器线程
-    let hr_web = heart_rate.clone();
-    thread::spawn(move || {
-        start_http_server(hr_web);
-    });
-
-    let adapter = Adapter::default()
-        .await
-        .ok_or("蓝牙设备未找到...")?;
-    adapter.wait_available().await?;
-
-    println!("开始扫描在线的小米设备...");
-    println!("请访问: http://localhost:8080/ 查看心率监测");
-    
-    let mut scan = adapter.scan(&[]).await?;
-
-    while let Some(discovered_device) = scan.next().await {
-        // 使用闭包捕获共享心率监视器
-        let hr_monitor = heart_rate.clone();
-        handle_device(discovered_device, move |rate, name, rssi| {
-            let mut monitor = hr_monitor.lock().unwrap();
-            monitor.update(rate, name, rssi);
-        });
-    }
-    Ok(())
-}
-
-// 原始处理函数保持不变，添加回调参数
-fn handle_device<F>(discovered_device: AdvertisingDevice, callback: F) 
-where
-    F: FnOnce(u8, &str, i16),
-{
+// 处理蓝牙设备
+fn handle_device(discovered_device: AdvertisingDevice, heart_rate: Arc<Mutex<HeartRateMonitor>>) {
     if let Some(manufacturer_data) = discovered_device.adv_data.manufacturer_data {
         if manufacturer_data.company_id != 0x0157 {
             return;
@@ -106,387 +382,43 @@ where
         if name != "Mi Smart Band 4" {
             return;
         }
-        let rssi = discovered_device.rssi.unwrap_or_default();
-        let heart_rate = manufacturer_data.data[3];
-        println!("{name} ({rssi}dBm) 心率: {heart_rate:?}");
+        let heart_rate_value = manufacturer_data.data[3];
         
-        // 调用回调函数更新共享状态
-        callback(heart_rate, &name, rssi);
+        println!("{name} 心率: {heart_rate_value:?}");
+        
+        let mut monitor = heart_rate.lock().unwrap();
+        monitor.update(heart_rate_value);
     }
 }
 
-// 创建心率更新数据结构
-fn create_heart_rate_update(monitor: &HeartRateMonitor) -> HeartRateUpdate {
-    let elapsed_secs = monitor.last_update.elapsed().as_secs();
-    let status = if monitor.is_recent() { 
-        "实时更新中".to_string() 
-    } else { 
-        "信号丢失".to_string() 
-    };
+// 启动蓝牙扫描
+async fn start_bluetooth_scan(
+    heart_rate: Arc<Mutex<HeartRateMonitor>>
+) -> Result<(), Box<dyn Error>> {
+    let adapter = Adapter::default()
+        .await
+        .ok_or("蓝牙设备未找到...")?;
+    adapter.wait_available().await?;
+
+    println!("开始扫描小米设备...");
+    println!("访问: http://localhost:1145 查看心率监测");
     
-    let status_color = if monitor.is_recent() { 
-        "#27ae60".to_string() 
-    } else { 
-        "#e74c3c".to_string() 
-    };
-    
-    HeartRateUpdate {
-        heart_rate: monitor.current_rate,
-        device_name: monitor.device_name.clone(),
-        rssi: monitor.rssi,
-        elapsed_secs,
-        status,
-        status_color,
-        history: monitor.history.iter().cloned().collect(),
+    let mut scan = adapter.scan(&[]).await?;
+
+    while let Some(discovered_device) = scan.next().await {
+        handle_device(discovered_device, heart_rate.clone());
     }
+    Ok(())
 }
 
-// HTTP服务器实现
-fn start_http_server(heart_rate: Arc<Mutex<HeartRateMonitor>>) {
-    let addr = "0.0.0.0:8080";
-    let server = Server::http(addr).expect("无法启动HTTP服务器");
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let heart_rate = Arc::new(Mutex::new(HeartRateMonitor::new()));
     
-    // 创建HTML内容类型头
-    let html_content_type = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
-        .expect("创建内容类型头失败");
+    let hr_web = heart_rate.clone();
+    thread::spawn(move || start_http_server(hr_web));
+
+    start_bluetooth_scan(heart_rate).await?;
     
-    // 创建JSON内容类型头
-    let json_content_type = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-        .expect("创建内容类型头失败");
-
-    for request in server.incoming_requests() {
-        // 处理数据端点
-        if request.url() == "/data" {
-            let monitor = heart_rate.lock().unwrap();
-            let update = create_heart_rate_update(&monitor);
-            let json = serde_json::to_string(&update).unwrap();
-            
-            let response = Response::from_string(json)
-                .with_header(json_content_type.clone());
-            
-            request.respond(response).expect("响应请求失败");
-            continue;
-        }
-        
-        // 主页面
-        let html = r#"
-        <!DOCTYPE html>
-        <html lang="zh-CN">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>小米手环4 心率监测</title>
-            <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-            <style>
-                * {
-                    box-sizing: border-box;
-                    margin: 0;
-                    padding: 0;
-                }
-                body {
-                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                    background: linear-gradient(135deg, #1a2a6c, #b21f1f, #fdbb2d);
-                    color: #fff;
-                    min-height: 100vh;
-                    display: flex;
-                    justify-content: center;
-                    align-items: center;
-                    padding: 20px;
-                }
-                .container {
-                    background: rgba(30, 30, 46, 0.85);
-                    backdrop-filter: blur(10px);
-                    border-radius: 20px;
-                    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
-                    width: 100%;
-                    max-width: 900px;
-                    padding: 30px;
-                    position: relative;
-                    overflow: hidden;
-                }
-                .container::before {
-                    content: '';
-                    position: absolute;
-                    top: 0;
-                    left: 0;
-                    right: 0;
-                    height: 5px;
-                    background: linear-gradient(90deg, #ff8a00, #da1b60);
-                }
-                h1 {
-                    text-align: center;
-                    margin-bottom: 25px;
-                    font-size: 32px;
-                    color: #ffffff;
-                    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
-                }
-                .status-header {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    margin-bottom: 30px;
-                    flex-wrap: wrap;
-                    gap: 20px;
-                }
-                .heart-rate-display {
-                    font-size: 120px;
-                    font-weight: 700;
-                    color: #ff6b6b;
-                    text-align: center;
-                    text-shadow: 0 0 20px rgba(255, 107, 107, 0.7);
-                    flex: 1;
-                    min-width: 200px;
-                }
-                .bpm {
-                    font-size: 24px;
-                    color: #a9a9a9;
-                    margin-top: -20px;
-                }
-                .device-info {
-                    background: rgba(255, 255, 255, 0.1);
-                    border-radius: 15px;
-                    padding: 20px;
-                    flex: 1;
-                    min-width: 250px;
-                }
-                .info-item {
-                    margin-bottom: 15px;
-                    display: flex;
-                    justify-content: space-between;
-                }
-                .info-label {
-                    color: #ccc;
-                }
-                .info-value {
-                    font-weight: 600;
-                    color: #fff;
-                }
-                .chart-container {
-                    background: rgba(255, 255, 255, 0.1);
-                    border-radius: 15px;
-                    padding: 20px;
-                    height: 350px;
-                    margin-top: 20px;
-                }
-                .footer {
-                    margin-top: 25px;
-                    text-align: center;
-                    font-size: 14px;
-                    color: #aaa;
-                }
-                @media (max-width: 768px) {
-                    .status-header {
-                        flex-direction: column;
-                    }
-                    .heart-rate-display {
-                        font-size: 80px;
-                    }
-                }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>小米手环4 实时心率监测</h1>
-                
-                <div class="status-header">
-                    <div class="heart-rate-display">
-                        <span id="heart-rate">0</span>
-                        <div class="bpm">BPM</div>
-                    </div>
-                    
-                    <div class="device-info">
-                        <div class="info-item">
-                            <span class="info-label">设备名称:</span>
-                            <span class="info-value" id="device-name">未知</span>
-                        </div>
-                        <div class="info-item">
-                            <span class="info-label">信号强度:</span>
-                            <span class="info-value" id="rssi">- dBm</span>
-                        </div>
-                        <div class="info-item">
-                            <span class="info-label">最后更新:</span>
-                            <span class="info-value" id="last-update">- 秒前</span>
-                        </div>
-                        <div class="info-item">
-                            <span class="info-label">当前状态:</span>
-                            <span class="info-value" id="status">等待数据...</span>
-                        </div>
-                    </div>
-                </div>
-                
-                <div class="chart-container">
-                    <canvas id="heartRateChart"></canvas>
-                </div>
-                
-                <div class="footer">
-                    实时数据更新 | 小米手环4心率监测系统
-                </div>
-            </div>
-
-            <script>
-                // 初始化图表
-                function initChart() {
-                    const ctx = document.getElementById('heartRateChart').getContext('2d');
-                    window.heartRateChart = new Chart(ctx, {
-                        type: 'line',
-                        data: {
-                            datasets: [{
-                                label: '心率 (BPM)',
-                                data: [],
-                                borderColor: '#ff6b6b',
-                                backgroundColor: 'rgba(255, 107, 107, 0.1)',
-                                borderWidth: 3,
-                                pointRadius: 4,
-                                pointBackgroundColor: '#fff',
-                                pointBorderColor: '#ff6b6b',
-                                tension: 0.4,
-                                fill: true
-                            }]
-                        },
-                        options: {
-                            responsive: true,
-                            maintainAspectRatio: false,
-                            animation: {
-                                duration: 0
-                            },
-                            scales: {
-                                x: {
-                                    type: 'linear', // 添加这行
-                                    min: 0,         // 添加这行
-                                    max: 59,        // 添加这行
-                                    grid: {
-                                        color: 'rgba(255, 255, 255, 0.1)'
-                                    },
-                                    ticks: {
-                                        color: '#ccc'
-                                    },
-                                    title: {
-                                        display: true,
-                                        text: '时间 (最近60个读数)',
-                                        color: '#ccc'
-                                    }
-                                },
-                                y: {
-                                    min: 40,
-                                    max: 120,
-                                    grid: {
-                                        color: 'rgba(255, 255, 255, 0.1)'
-                                    },
-                                    ticks: {
-                                        color: '#ccc',
-                                        stepSize: 20
-                                    },
-                                    title: {
-                                        display: true,
-                                        text: '心率 (BPM)',
-                                        color: '#ccc'
-                                    }
-                                }
-                            },
-                            plugins: {
-                                legend: {
-                                    labels: {
-                                        color: '#ccc'
-                                    }
-                                },
-                                // 添加以下工具提示配置
-                                tooltip: {
-                                    callbacks: {
-                                        title: (items) => `读数 #${items[0].parsed.x}`,
-                                        label: (context) => `心率: ${context.parsed.y} BPM`
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
-                
-                // 更新UI函数
-                function updateUI(data) {
-                    // 更新心率显示
-                    document.getElementById('heart-rate').textContent = data.heart_rate;
-                    
-                    // 更新设备名称
-                    document.getElementById('device-name').textContent = data.device_name;
-                    
-                    // 更新RSSI
-                    document.getElementById('rssi').textContent = data.rssi + ' dBm';
-                    
-                    // 更新最后更新时间
-                    document.getElementById('last-update').textContent = data.elapsed_secs + '秒前';
-                    
-                    // 更新状态
-                    const statusElement = document.getElementById('status');
-                    statusElement.textContent = data.status;
-                    statusElement.style.color = data.status_color;
-                    
-                    // 更新图表
-                    updateChart(data.history);
-                }
-                
-                // 更新图表
-                function updateChart(history) {
-                    if (!window.heartRateChart) {
-                        initChart();
-                    }
-                    
-                    // 创建正确的数据点数组
-                    const newData = [];
-                    const startIndex = Math.max(0, history.length - 60);
-                    
-                    for (let i = startIndex; i < history.length; i++) {
-                        // 计算正确的x轴位置（从0到59）
-                        const x = 59 - (history.length - 1 - i);
-                        newData.push({ 
-                            x: x, 
-                            y: history[i]
-                        });
-                    }
-                    
-                    // 如果数据不足60个，在前面填充空点
-                    if (newData.length < 60) {
-                        const emptyPoints = 60 - newData.length;
-                        for (let i = 0; i < emptyPoints; i++) {
-                            newData.unshift({ x: i, y: null });
-                        }
-                    }
-                    
-                    window.heartRateChart.data.datasets[0].data = newData;
-                    window.heartRateChart.update('none');
-                }
-                
-                // 获取最新心率数据
-                async function fetchHeartRateData() {
-                    try {
-                        const response = await fetch('/data');
-                        if (!response.ok) {
-                            throw new Error('网络响应异常');
-                        }
-                        const data = await response.json();
-                        updateUI(data);
-                    } catch (error) {
-                        console.error('获取数据失败:', error);
-                        document.getElementById('status').textContent = '数据获取失败';
-                    }
-                }
-                
-                // 初始化图表
-                initChart();
-                
-                // 立即获取数据
-                fetchHeartRateData();
-                
-                // 每2秒获取一次数据
-                setInterval(fetchHeartRateData, 2000);
-            </script>
-        </body>
-        </html>
-        "#;
-        
-        // 创建响应并设置正确的Content-Type头
-        let response = Response::from_string(html)
-            .with_header(html_content_type.clone());
-        
-        request.respond(response).expect("响应请求失败");
-    }
+    Ok(())
 }
