@@ -23,7 +23,7 @@ async fn web_server(rx: Receiver<i32>) {
     });
 
     let socket_addr: SocketAddr = ([127, 0, 0, 1], 3030).into();
-    println!("Start listening at http://{socket_addr:?}");
+    println!("开始监听于 http://{socket_addr:?}");
 
     warp::serve(warp::get().and(root).or(heartrate))
         .run(socket_addr)
@@ -33,11 +33,11 @@ async fn web_server(rx: Receiver<i32>) {
 async fn ble_scanner(tx: Sender<i32>) {
     let adapter = Adapter::default()
         .await
-        .ok_or("Bluetooth adapter not found")
+        .ok_or("未找到蓝牙适配器")
         .unwrap();
     adapter.wait_available().await.unwrap();
 
-    println!("Starting scan Xiaomi Band");
+    println!("开始搜索小米手环");
     let mut scan = adapter.scan(&[]).await.unwrap();
 
     while let Some(discovered_device) = scan.next().await {
@@ -52,17 +52,23 @@ fn handle_device(discovered_device: AdvertisingDevice) -> Option<i32> {
     if manufacturer_data.company_id != 0x0157 {
         return None;
     }
-    let name = discovered_device
+    let mut name = discovered_device
         .device
         .name()
-        .unwrap_or(String::from("(unknown)"));
-    let id = discovered_device.device.id();
+        .unwrap_or(String::from("(未知)"));
+    if name != "Mi Smart Band 4" {
+        return None;
+    }
+    else {
+        name = "小米手环 4".to_string();
+    }
+    // let id = discovered_device.device.id();
     let rssi = discovered_device.rssi.unwrap_or_default();
     let heart_rate = manufacturer_data.data[3];
     let heart_rate = match heart_rate {
         0xFF => None,
         x => Some(x.into()),
     };
-    println!("{name} {id} ({rssi}dBm) Heart Rate: {heart_rate:?}",);
+    println!("{name} ({rssi}dBm) 心率: {heart_rate:?}",);
     heart_rate
 }
